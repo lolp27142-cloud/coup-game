@@ -32,7 +32,7 @@ let gameState = {
 };
 
 function resetGame() {
-    // ПЕРЕД ПЕРЕЗАПУСКОМ: Окончательно удаляем всех, кто отключился в прошлой игре
+    // Перед перезапуском окончательно удаляем всех, кто отключился в прошлой игре
     gameState.players = gameState.players.filter(p => !p.disconnected);
     
     gameState.deck = createDeck();
@@ -175,6 +175,43 @@ function executeAction(sourcePlayer, actionData) {
     sendState();
 }
 
+function goToBlockOrExecute(sourceId, actionData) {
+    const srcPlayer = gameState.players.find(p => p.id === sourceId);
+    
+    if (actionData.action === 'foreign_aid') {
+        gameState.pendingAction = {
+            type: 'block_phase',
+            sourceId: sourceId,
+            actionData: actionData,
+            validBlocks: ['Герцог'],
+            message: `Игрок ${srcPlayer.name} берет Помощь (+2). Будет блок Герцогом?`,
+            passedPlayers: [sourceId]
+        };
+    } else if (actionData.action === 'steal') {
+        gameState.pendingAction = {
+            type: 'block_phase',
+            sourceId: sourceId,
+            actionData: actionData,
+            validBlocks: ['Капитан', 'Посол'],
+            message: `Игрок ${srcPlayer.name} крадет ваши монеты. Будет блок Капитаном или Послом?`,
+            passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
+        };
+    } else if (actionData.action === 'assassinate') {
+        gameState.pendingAction = {
+            type: 'block_phase',
+            sourceId: sourceId,
+            actionData: actionData,
+            validBlocks: ['Графиня'],
+            message: `Игрок ${srcPlayer.name} совершает покушение на вас. Заблокировать Графиней?`,
+            passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
+        };
+    } else {
+        executeAction(srcPlayer, actionData);
+        return;
+    }
+    sendState();
+}
+
 io.on('connection', (socket) => {
     socket.emit('lobbyUpdate', gameState.players);
     if (gameState.started) socket.emit('gameState', gameState);
@@ -188,7 +225,7 @@ io.on('connection', (socket) => {
             name: name || `Игрок ${gameState.players.length + 1}`,
             coins: 2,
             isDead: false,
-            disconnected: false, // Флаг сетевого статуса
+            disconnected: false,
             cards: []
         });
         log(`👤 ${gameState.players[gameState.players.length - 1].name} зашел в лобби`);
@@ -203,11 +240,51 @@ io.on('connection', (socket) => {
         sendState();
     });
 
+    // ВОТ ЭТОТ СТЕРТЫЙ КУСОК КОДА Я ВЕРНУЛ:
+    socket.on('playerAction', (data) => {
+        if (!gameState.started || gameState.pendingAction) return;
+        const player = gameState.players.find(p => p.id === socket.id);
+        if (!player || player.isDead) return;
+        if (gameState.players[gameState.currentTurnIdx].id !== socket.id) return;
+
+        // Если у игрока 10+ монет, он обязан крутить Переворот (Coup)
+        if (player.coins >= 10 && data.action !== 'coup') {
+            log(`⚠️ ${player.name}, у вас 10+ монет! Вы обязаны сделать Переворот.`);
+            return;
+        }
+
+        // Снимаем оплату за дорогие способности сразу
+        if (data.action === 'assassinate') {
+            if (player.coins < 3) { log(`⚠️ Недостаточно монет для Покушения!`); return; }
+            player.coins -= 3;
+        }
+        if (data.action === 'coup') {
+            if (player.coins < 7) { log(`⚠️ Недостаточно монет для Переворота!`); return; }
+            player.coins -= 7;
+        }
+
+        // Если это способность карты — запускаем фазу оспаривания блефа (Challenge)
+        if (actionRoles[data.action]) {
+            const claimedRole = actionRoles[data.action];
+            log(`📣 ${player.name} объявляет действие [${data.action}], заявляя роль [${claimedRole}]`);
+            gameState.pendingAction = {
+                type: 'challenge_action',
+                sourceId: socket.id,
+                actionData: data,
+                claimedRole: claimedRole,
+                message: `Игрок ${player.name} использует способность роли [${claimedRole}]. Кто-то оспорит?`,
+                passedPlayers: [socket.id]
+            };
+            sendState();
+        } else {
+            // Обычные действия (доход, помощь, переворот) идут без проверки блефа
+            goToBlockOrExecute(socket.id, data);
+        }
+    });
+
     socket.on('restartGame', () => {
-        // Перед попыткой рестарта фильтруем ушедших
         gameState.players = gameState.players.filter(p => !p.disconnected);
 
-        // Если живых участников осталось меньше двух, запустить нельзя — возвращаем в лобби
         if (gameState.players.length < 2) {
             log('⚠️ Недостаточно игроков для перезапуска. Возврат в лобби.');
             io.emit('backToLobby');
@@ -225,7 +302,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('leaveToLobby', () => {
-        // Ручной выход игрока обратно в главное меню
         socket.emit('backToLobby');
     });
 
@@ -390,43 +466,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    function goToBlockOrExecute(sourceId, actionData) {
-        const srcPlayer = gameState.players.find(p => p.id === sourceId);
-        
-        if (actionData.action === 'foreign_aid') {
-            gameState.pendingAction = {
-                type: 'block_phase',
-                sourceId: sourceId,
-                actionData: actionData,
-                validBlocks: ['Герцог'],
-                message: `Игрок ${srcPlayer.name} берет Помощь (+2). Будет блок Герцогом?`,
-                passedPlayers: [sourceId]
-            };
-        } else if (actionData.action === 'steal') {
-            gameState.pendingAction = {
-                type: 'block_phase',
-                sourceId: sourceId,
-                actionData: actionData,
-                validBlocks: ['Капитан', 'Посол'],
-                message: `Игрок ${srcPlayer.name} крадет ваши монеты. Будет блок Капитаном или Послом?`,
-                passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
-            };
-        } else if (actionData.action === 'assassinate') {
-            gameState.pendingAction = {
-                type: 'block_phase',
-                sourceId: sourceId,
-                actionData: actionData,
-                validBlocks: ['Графиня'],
-                message: `Игрок ${srcPlayer.name} совершает покушение на вас. Заблокировать Графиней?`,
-                passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
-            };
-        } else {
-            executeAction(srcPlayer, actionData);
-            return;
-        }
-        sendState();
-    }
-
     socket.on('disconnect', () => {
         const pIdx = gameState.players.findIndex(p => p.id === socket.id);
         if (pIdx !== -1) {
@@ -434,13 +473,11 @@ io.on('connection', (socket) => {
             log(`🚪 ${player.name} вышел из игры`);
             
             if (gameState.started) {
-                // Если идет матч, ставим метку отключения, чтобы удалить ПОСЛЕ конца кона
                 player.isDead = true;
                 player.disconnected = true;
                 player.cards.forEach(c => c.isDead = true);
                 checkPlayerDeath(player);
             } else {
-                // Если в лобби, удаляем сразу
                 gameState.players.splice(pIdx, 1);
             }
             
