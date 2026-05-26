@@ -198,13 +198,25 @@ io.on('connection', (socket) => {
         sendState();
     });
 
-    socket.on('restartGame', () => {
-        if (!gameState.started) {
-            resetGame();
-            gameState.started = true;
-            log('🎮 Новая игра началась!');
-            sendState();
-        }
+    socket.on('returnToLobby', () => {
+        gameState.started = false;
+        
+        // Вычищаем всех игроков, которые ливнули во время игры
+        gameState.players = gameState.players.filter(p => !p.disconnected);
+        
+        // Сбрасываем состояния оставшихся игроков
+        gameState.players.forEach(p => {
+            p.coins = 2;
+            p.isDead = false;
+            p.cards = [];
+        });
+        
+        gameState.pendingAction = null;
+        gameState.currentTurnIdx = 0;
+        
+        log('🏠 Все вернулись в лобби');
+        io.emit('lobbyUpdate', gameState.players);
+        io.emit('backToLobby'); // Сигнал клиентам сменить экраны
     });
 
     socket.on('playerAction', (data) => {
@@ -459,14 +471,26 @@ io.on('connection', (socket) => {
         if (pIdx !== -1) {
             const player = gameState.players[pIdx];
             log(`🚪 ${player.name} вышел из игры`);
+            
             if (gameState.started) {
                 player.isDead = true;
                 player.cards.forEach(c => c.isDead = true);
-                checkPlayerDeath(player);
+                player.disconnected = true; // Помечаем, чтобы выкинуть из массива в лобби
+                
+                const isWin = checkWin(); // Напрямую проверяем победу
+                
+                // Если игра не закончилась, но зависла на ливнувшем игроке — сбрасываем окно реакции и передаем ход
+                if (!isWin && (gameState.players[gameState.currentTurnIdx].id === socket.id || gameState.pendingAction)) {
+                    gameState.pendingAction = null;
+                    nextTurn();
+                }
             } else {
+                // Если ливнули до начала игры, просто удаляем
                 gameState.players.splice(pIdx, 1);
             }
-            io.emit('lobbyUpdate', gameState.players);
+            
+            // Отправляем в лобби только тех, кто еще в сети
+            io.emit('lobbyUpdate', gameState.players.filter(p => !p.disconnected));
             sendState();
         }
     });
