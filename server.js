@@ -1,8 +1,7 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
-const path = require('path'); // Добавили модуль для путей
-
+const path = require('path');
 const io = require('socket.io')(http, {
     cors: {
         origin: "*", 
@@ -33,6 +32,9 @@ let gameState = {
 };
 
 function resetGame() {
+    // ПЕРЕД ПЕРЕЗАПУСКОМ: Окончательно удаляем всех, кто отключился в прошлой игре
+    gameState.players = gameState.players.filter(p => !p.disconnected);
+    
     gameState.deck = createDeck();
     gameState.currentTurnIdx = 0;
     gameState.pendingAction = null;
@@ -72,16 +74,16 @@ function checkPlayerDeath(player) {
 function checkWin() {
     if (!gameState.started) return false;
     const alive = getAlivePlayers();
-    if (alive.length === 1) {
-        log(`🏆 Победил игрок ${alive[0].name}!`);
-        io.emit('gameOver', alive[0].name);
+    
+    if (alive.length === 1 || alive.length === 0) {
+        const winnerName = alive.length === 1 ? alive[0].name : 'Ничья';
+        log(`🏆 Игра окончена! Результат: ${winnerName}`);
+        io.emit('gameOver', winnerName);
         gameState.started = false;
-        return true;
-    }
-    if (alive.length === 0) {
-        log(`🤝 Ничья! Все игроки выбыли.`);
-        io.emit('gameOver', 'Ничья');
-        gameState.started = false;
+        
+        // Очищаем массив от "призраков" сразу после финала, чтобы обновить лобби
+        gameState.players = gameState.players.filter(p => !p.disconnected);
+        io.emit('lobbyUpdate', gameState.players);
         return true;
     }
     return false;
@@ -186,6 +188,7 @@ io.on('connection', (socket) => {
             name: name || `Игрок ${gameState.players.length + 1}`,
             coins: 2,
             isDead: false,
+            disconnected: false, // Флаг сетевого статуса
             cards: []
         });
         log(`👤 ${gameState.players[gameState.players.length - 1].name} зашел в лобби`);
@@ -200,77 +203,30 @@ io.on('connection', (socket) => {
         sendState();
     });
 
-    socket.on('returnToLobby', () => {
-        gameState.started = false;
-        
-        // Вычищаем всех игроков, которые ливнули во время игры
+    socket.on('restartGame', () => {
+        // Перед попыткой рестарта фильтруем ушедших
         gameState.players = gameState.players.filter(p => !p.disconnected);
-        
-        // Сбрасываем состояния оставшихся игроков
-        gameState.players.forEach(p => {
-            p.coins = 2;
-            p.isDead = false;
-            p.cards = [];
-        });
-        
-        gameState.pendingAction = null;
-        gameState.currentTurnIdx = 0;
-        
-        log('🏠 Все вернулись в лобби');
-        io.emit('lobbyUpdate', gameState.players);
-        io.emit('backToLobby'); // Сигнал клиентам сменить экраны
-    });
 
-    socket.on('playerAction', (data) => {
-        if (!gameState.started || gameState.pendingAction) return;
-        const player = gameState.players[gameState.currentTurnIdx];
-        if (!player || player.id !== socket.id || player.isDead) return;
-
-        if (data.action === 'assassinate' && player.coins < 3) return;
-        if (data.action === 'coup' && player.coins < 7) return;
-        if (player.coins >= 10 && data.action !== 'coup') return;
-
-        if (data.action === 'assassinate') player.coins -= 3;
-        if (data.action === 'coup') player.coins -= 7;
-
-        const targetPlayer = data.target ? gameState.players.find(p => p.id === data.target) : null;
-        const targetName = targetPlayer ? targetPlayer.name : '';
-
-        let actionText = '';
-        if (data.action === 'income') actionText = 'берет Доход';
-        if (data.action === 'foreign_aid') actionText = 'хочет взять Помощь (+2)';
-        if (data.action === 'tax') actionText = 'заявляет Герцога и берет Налог (+3)';
-        if (data.action === 'steal') actionText = `заявляет Капитана и хочет украсть у ${targetName}`;
-        if (data.action === 'assassinate') actionText = `заявляет Убийцу и совершает покушение на ${targetName}`;
-        if (data.action === 'coup') actionText = `совершает Переворот против ${targetName}`;
-        if (data.action === 'exchange') actionText = 'заявляет Посла и делает обмен карт';
-
-        log(`📣 ${player.name}: ${actionText}`);
-
-        const claimedRole = actionRoles[data.action];
-        if (claimedRole) {
-            gameState.pendingAction = {
-                type: 'challenge_action',
-                sourceId: player.id,
-                actionData: data,
-                claimedRole: claimedRole,
-                message: `Игрок ${player.name} объявляет роль [${claimedRole}] для действия: "${actionText}". Верим?`,
-                passedPlayers: [player.id]
-            };
-        } else if (data.action === 'foreign_aid') {
-            gameState.pendingAction = {
-                type: 'block_phase',
-                sourceId: player.id,
-                actionData: data,
-                validBlocks: ['Герцог'],
-                message: `Игрок ${player.name} пытается получить Помощь (+2). Кто-то заблокирует Герцогом?`,
-                passedPlayers: [player.id]
-            };
-        } else {
-            executeAction(player, data);
+        // Если живых участников осталось меньше двух, запустить нельзя — возвращаем в лобби
+        if (gameState.players.length < 2) {
+            log('⚠️ Недостаточно игроков для перезапуска. Возврат в лобби.');
+            io.emit('backToLobby');
+            gameState.started = false;
+            io.emit('lobbyUpdate', gameState.players);
             return;
         }
-        sendState();
+
+        if (!gameState.started) {
+            resetGame();
+            gameState.started = true;
+            log('🎮 Новая игра началась!');
+            sendState();
+        }
+    });
+
+    socket.on('leaveToLobby', () => {
+        // Ручной выход игрока обратно в главное меню
+        socket.emit('backToLobby');
     });
 
     socket.on('reaction', (data) => {
@@ -397,14 +353,17 @@ io.on('connection', (socket) => {
             checkPlayerDeath(player);
 
             const next = action.nextAction;
-            if (next.type === 'endTurn') {
+            if (next && next.type === 'endTurn') {
                 gameState.pendingAction = null;
                 nextTurn();
-            } else if (next.type === 'continueAfterChallengeSuccess') {
+            } else if (next && next.type === 'continueAfterChallengeSuccess') {
                 goToBlockOrExecute(next.sourceId, next.actionData);
-            } else if (next.type === 'executeAfterChallengeBlockFailure') {
+            } else if (next && next.type === 'executeAfterChallengeBlockFailure') {
                 const srcPlayer = gameState.players.find(p => p.id === next.sourceId);
                 executeAction(srcPlayer, next.actionData);
+            } else {
+                gameState.pendingAction = null;
+                nextTurn();
             }
             sendState();
         }
@@ -475,31 +434,23 @@ io.on('connection', (socket) => {
             log(`🚪 ${player.name} вышел из игры`);
             
             if (gameState.started) {
+                // Если идет матч, ставим метку отключения, чтобы удалить ПОСЛЕ конца кона
                 player.isDead = true;
+                player.disconnected = true;
                 player.cards.forEach(c => c.isDead = true);
-                player.disconnected = true; // Помечаем, чтобы выкинуть из массива в лобби
-                
-                const isWin = checkWin(); // Напрямую проверяем победу
-                
-                // Если игра не закончилась, но зависла на ливнувшем игроке — сбрасываем окно реакции и передаем ход
-                if (!isWin && (gameState.players[gameState.currentTurnIdx].id === socket.id || gameState.pendingAction)) {
-                    gameState.pendingAction = null;
-                    nextTurn();
-                }
+                checkPlayerDeath(player);
             } else {
-                // Если ливнули до начала игры, просто удаляем
+                // Если в лобби, удаляем сразу
                 gameState.players.splice(pIdx, 1);
             }
             
-            // Отправляем в лобби только тех, кто еще в сети
-            io.emit('lobbyUpdate', gameState.players.filter(p => !p.disconnected));
+            io.emit('lobbyUpdate', gameState.players);
             sendState();
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
-
 http.listen(PORT, () => {
     console.log(`Сервер запущен на порту: ${PORT}`);
 });
