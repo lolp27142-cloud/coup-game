@@ -1,6 +1,8 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
+const path = require('path'); // Добавили модуль для путей
+
 const io = require('socket.io')(http, {
     cors: {
         origin: "*", 
@@ -9,7 +11,7 @@ const io = require('socket.io')(http, {
 });
 
 app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/index.html');
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 function createDeck() {
