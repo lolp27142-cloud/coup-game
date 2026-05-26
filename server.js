@@ -32,7 +32,7 @@ let gameState = {
 };
 
 function resetGame() {
-    // Перед перезапуском окончательно удаляем всех, кто отключился в прошлой игре
+    // Вычищаем всех, кто ливнул, чтобы они не ломали очередь ходов
     gameState.players = gameState.players.filter(p => !p.disconnected);
     
     gameState.deck = createDeck();
@@ -81,7 +81,7 @@ function checkWin() {
         io.emit('gameOver', winnerName);
         gameState.started = false;
         
-        // Очищаем массив от "призраков" сразу после финала, чтобы обновить лобби
+        // Очищаем массив от призраков для лобби
         gameState.players = gameState.players.filter(p => !p.disconnected);
         io.emit('lobbyUpdate', gameState.players);
         return true;
@@ -177,7 +177,14 @@ function executeAction(sourcePlayer, actionData) {
 
 function goToBlockOrExecute(sourceId, actionData) {
     const srcPlayer = gameState.players.find(p => p.id === sourceId);
+    const targetPlayer = actionData.target ? gameState.players.find(p => p.id === actionData.target) : null;
     
+    // ФИКС СОФТЛОКА: Если цель убили во время проверки "Не верю", просто скипаем фазу блока и отменяем действие
+    if (targetPlayer && targetPlayer.isDead) {
+        executeAction(srcPlayer, actionData);
+        return;
+    }
+
     if (actionData.action === 'foreign_aid') {
         gameState.pendingAction = {
             type: 'block_phase',
@@ -240,46 +247,57 @@ io.on('connection', (socket) => {
         sendState();
     });
 
-    // ВОТ ЭТОТ СТЕРТЫЙ КУСОК КОДА Я ВЕРНУЛ:
+    // ОРИГИНАЛЬНАЯ РАБОЧАЯ ЛОГИКА ДЕЙСТВИЙ ИГРОКОВ:
     socket.on('playerAction', (data) => {
         if (!gameState.started || gameState.pendingAction) return;
-        const player = gameState.players.find(p => p.id === socket.id);
-        if (!player || player.isDead) return;
-        if (gameState.players[gameState.currentTurnIdx].id !== socket.id) return;
+        const player = gameState.players[gameState.currentTurnIdx];
+        if (!player || player.id !== socket.id || player.isDead) return;
 
-        // Если у игрока 10+ монет, он обязан крутить Переворот (Coup)
-        if (player.coins >= 10 && data.action !== 'coup') {
-            log(`⚠️ ${player.name}, у вас 10+ монет! Вы обязаны сделать Переворот.`);
-            return;
-        }
+        if (data.action === 'assassinate' && player.coins < 3) return;
+        if (data.action === 'coup' && player.coins < 7) return;
+        if (player.coins >= 10 && data.action !== 'coup') return;
 
-        // Снимаем оплату за дорогие способности сразу
-        if (data.action === 'assassinate') {
-            if (player.coins < 3) { log(`⚠️ Недостаточно монет для Покушения!`); return; }
-            player.coins -= 3;
-        }
-        if (data.action === 'coup') {
-            if (player.coins < 7) { log(`⚠️ Недостаточно монет для Переворота!`); return; }
-            player.coins -= 7;
-        }
+        if (data.action === 'assassinate') player.coins -= 3;
+        if (data.action === 'coup') player.coins -= 7;
 
-        // Если это способность карты — запускаем фазу оспаривания блефа (Challenge)
-        if (actionRoles[data.action]) {
-            const claimedRole = actionRoles[data.action];
-            log(`📣 ${player.name} объявляет действие [${data.action}], заявляя роль [${claimedRole}]`);
+        const targetPlayer = data.target ? gameState.players.find(p => p.id === data.target) : null;
+        const targetName = targetPlayer ? targetPlayer.name : '';
+
+        let actionText = '';
+        if (data.action === 'income') actionText = 'берет Доход';
+        if (data.action === 'foreign_aid') actionText = 'хочет взять Помощь (+2)';
+        if (data.action === 'tax') actionText = 'заявляет Герцога и берет Налог (+3)';
+        if (data.action === 'steal') actionText = `заявляет Капитана и хочет украсть у ${targetName}`;
+        if (data.action === 'assassinate') actionText = `заявляет Убийцу и совершает покушение на ${targetName}`;
+        if (data.action === 'coup') actionText = `совершает Переворот против ${targetName}`;
+        if (data.action === 'exchange') actionText = 'заявляет Посла и делает обмен карт';
+
+        log(`📣 ${player.name}: ${actionText}`);
+
+        const claimedRole = actionRoles[data.action];
+        if (claimedRole) {
             gameState.pendingAction = {
                 type: 'challenge_action',
-                sourceId: socket.id,
+                sourceId: player.id,
                 actionData: data,
                 claimedRole: claimedRole,
-                message: `Игрок ${player.name} использует способность роли [${claimedRole}]. Кто-то оспорит?`,
-                passedPlayers: [socket.id]
+                message: `Игрок ${player.name} объявляет роль [${claimedRole}] для действия: "${actionText}". Верим?`,
+                passedPlayers: [player.id]
             };
-            sendState();
+        } else if (data.action === 'foreign_aid') {
+            gameState.pendingAction = {
+                type: 'block_phase',
+                sourceId: player.id,
+                actionData: data,
+                validBlocks: ['Герцог'],
+                message: `Игрок ${player.name} пытается получить Помощь (+2). Кто-то заблокирует Герцогом?`,
+                passedPlayers: [player.id]
+            };
         } else {
-            // Обычные действия (доход, помощь, переворот) идут без проверки блефа
-            goToBlockOrExecute(socket.id, data);
+            executeAction(player, data);
+            return;
         }
+        sendState();
     });
 
     socket.on('restartGame', () => {
@@ -428,6 +446,13 @@ io.on('connection', (socket) => {
             log(`💀 ${player.name} теряет карту [${player.cards[data.cardIndex].role}]`);
             checkPlayerDeath(player);
 
+            // Если после потери карты игра закончилась (кто-то победил), останавливаем цепочку действий
+            if (!gameState.started) {
+                gameState.pendingAction = null;
+                sendState();
+                return;
+            }
+
             const next = action.nextAction;
             if (next && next.type === 'endTurn') {
                 gameState.pendingAction = null;
@@ -477,11 +502,17 @@ io.on('connection', (socket) => {
                 player.disconnected = true;
                 player.cards.forEach(c => c.isDead = true);
                 checkPlayerDeath(player);
+                
+                // Если после лива игра всё ещё идёт, а завис ход ливнувшего, двигаем дальше
+                if (gameState.started && (gameState.players[gameState.currentTurnIdx].id === socket.id || gameState.pendingAction)) {
+                    gameState.pendingAction = null;
+                    nextTurn();
+                }
             } else {
                 gameState.players.splice(pIdx, 1);
             }
             
-            io.emit('lobbyUpdate', gameState.players);
+            io.emit('lobbyUpdate', gameState.players.filter(p => !p.disconnected));
             sendState();
         }
     });
