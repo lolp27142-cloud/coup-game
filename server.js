@@ -2,11 +2,11 @@ const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
 const path = require('path');
+// ФИКС ВЫЛЕТОВ: Увеличиваем таймаут пинга до 2-х минут (120000 мс)
 const io = require('socket.io')(http, {
-    cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
-    }
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    pingTimeout: 120000, 
+    pingInterval: 25000
 });
 
 app.get('/', (req, res) => {
@@ -28,13 +28,12 @@ let gameState = {
     currentTurnIdx: 0,
     pendingAction: null,
     started: false,
+    hideDiscards: false, // Настройка скрытых сбросов
     deck: createDeck()
 };
 
 function resetGame() {
-    // Вычищаем всех, кто ливнул, чтобы они не ломали очередь ходов
     gameState.players = gameState.players.filter(p => !p.disconnected);
-    
     gameState.deck = createDeck();
     gameState.currentTurnIdx = 0;
     gameState.pendingAction = null;
@@ -80,8 +79,6 @@ function checkWin() {
         log(`🏆 Игра окончена! Результат: ${winnerName}`);
         io.emit('gameOver', winnerName);
         gameState.started = false;
-        
-        // Очищаем массив от призраков для лобби
         gameState.players = gameState.players.filter(p => !p.disconnected);
         io.emit('lobbyUpdate', gameState.players);
         return true;
@@ -89,9 +86,7 @@ function checkWin() {
     return false;
 }
 
-function sendState() {
-    io.emit('gameState', gameState);
-}
+function sendState() { io.emit('gameState', gameState); }
 
 function log(text) {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -99,10 +94,7 @@ function log(text) {
 }
 
 const actionRoles = {
-    'tax': 'Герцог',
-    'steal': 'Капитан',
-    'assassinate': 'Убийца',
-    'exchange': 'Посол'
+    'tax': 'Герцог', 'steal': 'Капитан', 'assassinate': 'Убийца', 'exchange': 'Посол'
 };
 
 function executeAction(sourcePlayer, actionData) {
@@ -140,8 +132,7 @@ function executeAction(sourcePlayer, actionData) {
             if (!target || target.isDead) { gameState.pendingAction = null; nextTurn(); break; }
             log(`🗡️ Покушение на ${target.name} успешно!`);
             gameState.pendingAction = {
-                type: 'loseCard',
-                targetId: target.id,
+                type: 'loseCard', targetId: target.id,
                 message: `${sourcePlayer.name} совершил покушение на вас! Выберите карту для сброса:`,
                 nextAction: { type: 'endTurn' }
             };
@@ -150,8 +141,7 @@ function executeAction(sourcePlayer, actionData) {
             if (!target || target.isDead) { gameState.pendingAction = null; nextTurn(); break; }
             log(`💥 ${sourcePlayer.name} совершает переворот против ${target.name}!`);
             gameState.pendingAction = {
-                type: 'loseCard',
-                targetId: target.id,
+                type: 'loseCard', targetId: target.id,
                 message: `${sourcePlayer.name} совершил переворот против вас! Выберите карту для сброса:`,
                 nextAction: { type: 'endTurn' }
             };
@@ -163,10 +153,8 @@ function executeAction(sourcePlayer, actionData) {
             const options = [...currentAliveCards, card1, card2];
             
             gameState.pendingAction = {
-                type: 'exchange',
-                targetId: sourcePlayer.id,
-                options: options,
-                requiredToKeep: currentAliveCards.length,
+                type: 'exchange', targetId: sourcePlayer.id,
+                options: options, requiredToKeep: currentAliveCards.length,
                 message: `Выберите ${currentAliveCards.length} карту(-ы), чтобы оставить себе:`
             };
             log(`🔄 ${sourcePlayer.name} выбирает карты для обмена`);
@@ -179,42 +167,30 @@ function goToBlockOrExecute(sourceId, actionData) {
     const srcPlayer = gameState.players.find(p => p.id === sourceId);
     const targetPlayer = actionData.target ? gameState.players.find(p => p.id === actionData.target) : null;
     
-    // ФИКС СОФТЛОКА: Если цель убили во время проверки "Не верю", просто скипаем фазу блока и отменяем действие
     if (targetPlayer && targetPlayer.isDead) {
-        executeAction(srcPlayer, actionData);
-        return;
+        executeAction(srcPlayer, actionData); return;
     }
 
     if (actionData.action === 'foreign_aid') {
         gameState.pendingAction = {
-            type: 'block_phase',
-            sourceId: sourceId,
-            actionData: actionData,
-            validBlocks: ['Герцог'],
-            message: `Игрок ${srcPlayer.name} берет Помощь (+2). Будет блок Герцогом?`,
+            type: 'block_phase', sourceId: sourceId, actionData: actionData,
+            validBlocks: ['Герцог'], message: `Игрок ${srcPlayer.name} берет Помощь (+2). Будет блок Герцогом?`,
             passedPlayers: [sourceId]
         };
     } else if (actionData.action === 'steal') {
         gameState.pendingAction = {
-            type: 'block_phase',
-            sourceId: sourceId,
-            actionData: actionData,
-            validBlocks: ['Капитан', 'Посол'],
-            message: `Игрок ${srcPlayer.name} крадет ваши монеты. Будет блок Капитаном или Послом?`,
+            type: 'block_phase', sourceId: sourceId, actionData: actionData,
+            validBlocks: ['Капитан', 'Посол'], message: `Игрок ${srcPlayer.name} крадет ваши монеты. Будет блок Капитаном или Послом?`,
             passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
         };
     } else if (actionData.action === 'assassinate') {
         gameState.pendingAction = {
-            type: 'block_phase',
-            sourceId: sourceId,
-            actionData: actionData,
-            validBlocks: ['Графиня'],
-            message: `Игрок ${srcPlayer.name} совершает покушение на вас. Заблокировать Графиней?`,
+            type: 'block_phase', sourceId: sourceId, actionData: actionData,
+            validBlocks: ['Графиня'], message: `Игрок ${srcPlayer.name} совершает покушение на вас. Заблокировать Графиней?`,
             passedPlayers: gameState.players.filter(p => p.id !== actionData.target).map(p => p.id)
         };
     } else {
-        executeAction(srcPlayer, actionData);
-        return;
+        executeAction(srcPlayer, actionData); return;
     }
     sendState();
 }
@@ -224,30 +200,25 @@ io.on('connection', (socket) => {
     if (gameState.started) socket.emit('gameState', gameState);
 
     socket.on('joinLobby', (name) => {
-        if (gameState.started) return;
-        if (gameState.players.find(p => p.id === socket.id)) return;
-
+        if (gameState.started || gameState.players.find(p => p.id === socket.id)) return;
         gameState.players.push({
-            id: socket.id,
-            name: name || `Игрок ${gameState.players.length + 1}`,
-            coins: 2,
-            isDead: false,
-            disconnected: false,
-            cards: []
+            id: socket.id, name: name || `Игрок ${gameState.players.length + 1}`,
+            coins: 2, isDead: false, disconnected: false, cards: []
         });
         log(`👤 ${gameState.players[gameState.players.length - 1].name} зашел в лобби`);
         io.emit('lobbyUpdate', gameState.players);
     });
 
-    socket.on('startGame', () => {
+    socket.on('startGame', (config) => {
         if (gameState.players.length < 2 || gameState.started) return;
         gameState.started = true;
+        gameState.hideDiscards = config ? config.hideDiscards : false; // Применяем настройку хоста
         resetGame();
         log('🎮 Игра началась! Всем раздано по 2 карты и 2 монеты.');
+        if (gameState.hideDiscards) log('🤫 Включен режим Скрытого Сброса карт!');
         sendState();
     });
 
-    // ОРИГИНАЛЬНАЯ РАБОЧАЯ ЛОГИКА ДЕЙСТВИЙ ИГРОКОВ:
     socket.on('playerAction', (data) => {
         if (!gameState.started || gameState.pendingAction) return;
         const player = gameState.players[gameState.currentTurnIdx];
@@ -277,41 +248,32 @@ io.on('connection', (socket) => {
         const claimedRole = actionRoles[data.action];
         if (claimedRole) {
             gameState.pendingAction = {
-                type: 'challenge_action',
-                sourceId: player.id,
-                actionData: data,
-                claimedRole: claimedRole,
-                message: `Игрок ${player.name} объявляет роль [${claimedRole}] для действия: "${actionText}". Верим?`,
+                type: 'challenge_action', sourceId: player.id, actionData: data,
+                claimedRole: claimedRole, message: `Игрок ${player.name} объявляет роль [${claimedRole}] для действия: "${actionText}". Верим?`,
                 passedPlayers: [player.id]
             };
         } else if (data.action === 'foreign_aid') {
             gameState.pendingAction = {
-                type: 'block_phase',
-                sourceId: player.id,
-                actionData: data,
-                validBlocks: ['Герцог'],
-                message: `Игрок ${player.name} пытается получить Помощь (+2). Кто-то заблокирует Герцогом?`,
+                type: 'block_phase', sourceId: player.id, actionData: data,
+                validBlocks: ['Герцог'], message: `Игрок ${player.name} пытается получить Помощь (+2). Кто-то заблокирует Герцогом?`,
                 passedPlayers: [player.id]
             };
         } else {
-            executeAction(player, data);
-            return;
+            executeAction(player, data); return;
         }
         sendState();
     });
 
-    socket.on('restartGame', () => {
+    socket.on('restartGame', (config) => {
         gameState.players = gameState.players.filter(p => !p.disconnected);
-
         if (gameState.players.length < 2) {
-            log('⚠️ Недостаточно игроков для перезапуска. Возврат в лобби.');
             io.emit('backToLobby');
             gameState.started = false;
             io.emit('lobbyUpdate', gameState.players);
             return;
         }
-
         if (!gameState.started) {
+            gameState.hideDiscards = config ? config.hideDiscards : false;
             resetGame();
             gameState.started = true;
             log('🎮 Новая игра началась!');
@@ -319,8 +281,33 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Обработчик кнопки выхода в меню во время матча
     socket.on('leaveToLobby', () => {
-        socket.emit('backToLobby');
+        const pIdx = gameState.players.findIndex(p => p.id === socket.id);
+        if (pIdx !== -1) {
+            const player = gameState.players[pIdx];
+            log(`🚪 ${player.name} сдался и вышел в меню`);
+            
+            if (gameState.started && !player.isDead) {
+                player.isDead = true;
+                player.disconnected = true;
+                player.cards.forEach(c => c.isDead = true);
+                checkPlayerDeath(player);
+                
+                // Фикс зависания, если игрок ливнул во время своего хода или когда на нем висел выбор
+                if (gameState.started && (gameState.players[gameState.currentTurnIdx].id === socket.id || 
+                   (gameState.pendingAction && gameState.pendingAction.targetId === socket.id))) {
+                    gameState.pendingAction = null;
+                    nextTurn();
+                }
+            } else if (!gameState.started) {
+                gameState.players.splice(pIdx, 1);
+            }
+            
+            socket.emit('backToLobby');
+            io.emit('lobbyUpdate', gameState.players.filter(p => !p.disconnected));
+            sendState();
+        }
     });
 
     socket.on('reaction', (data) => {
@@ -334,9 +321,7 @@ io.on('connection', (socket) => {
                 if (!action.passedPlayers.includes(socket.id)) action.passedPlayers.push(socket.id);
                 if (action.passedPlayers.length >= getAlivePlayers().length) {
                     goToBlockOrExecute(action.sourceId, action.actionData);
-                } else {
-                    sendState();
-                }
+                } else sendState();
             } else if (data.type === 'challenge') {
                 const accused = gameState.players.find(p => p.id === action.sourceId);
                 log(`🕵️ ${player.name} говорит "Не верю!" игроку ${accused.name} на роль [${action.claimedRole}]`);
@@ -349,9 +334,9 @@ io.on('connection', (socket) => {
                     gameState.deck.push(action.claimedRole);
                     gameState.deck.sort(() => Math.random() - 0.5);
 
+                    // ИСПРАВЛЕНИЕ: ЖЕСТКОЕ НАЗНАЧЕНИЕ ШТРАФА ОППОНЕНТУ
                     gameState.pendingAction = {
-                        type: 'loseCard',
-                        targetId: player.id,
+                        type: 'loseCard', targetId: player.id,
                         message: `Вы ошиблись! Сбросьте одну карту в качестве штрафа:`,
                         nextAction: { type: 'continueAfterChallengeSuccess', sourceId: action.sourceId, actionData: action.actionData }
                     };
@@ -360,8 +345,7 @@ io.on('connection', (socket) => {
                     if (action.actionData.action === 'assassinate') accused.coins += 3;
                     
                     gameState.pendingAction = {
-                        type: 'loseCard',
-                        targetId: accused.id,
+                        type: 'loseCard', targetId: accused.id,
                         message: `Вас поймали на лжи! Выберите карту для сброса:`,
                         nextAction: { type: 'endTurn' }
                     };
@@ -376,19 +360,13 @@ io.on('connection', (socket) => {
                 if (action.passedPlayers.length >= getAlivePlayers().length) {
                     const srcPlayer = gameState.players.find(p => p.id === action.sourceId);
                     executeAction(srcPlayer, action.actionData);
-                } else {
-                    sendState();
-                }
+                } else sendState();
             } else if (data.type === 'block') {
                 if (!action.validBlocks.includes(data.claimedRole)) return;
-                
                 log(`🛡️ ${player.name} объявляет БЛОК, заявляя роль [${data.claimedRole}]`);
                 gameState.pendingAction = {
-                    type: 'challenge_block',
-                    blockerId: player.id,
-                    originalSourceId: action.sourceId,
-                    actionData: action.actionData,
-                    claimedRole: data.claimedRole,
+                    type: 'challenge_block', blockerId: player.id, originalSourceId: action.sourceId,
+                    actionData: action.actionData, claimedRole: data.claimedRole,
                     message: `Игрок ${player.name} блокирует действие ролью [${data.claimedRole}]. Кто-то оспорит блок?`,
                     passedPlayers: [player.id]
                 };
@@ -401,12 +379,8 @@ io.on('connection', (socket) => {
                 if (!action.passedPlayers.includes(socket.id)) action.passedPlayers.push(socket.id);
                 if (action.passedPlayers.length >= getAlivePlayers().length) {
                     log(`✅ Блок успешен. Действие отменено.`);
-                    gameState.pendingAction = null;
-                    nextTurn();
-                    sendState();
-                } else {
-                    sendState();
-                }
+                    gameState.pendingAction = null; nextTurn(); sendState();
+                } else sendState();
             } else if (data.type === 'challenge') {
                 const blocker = gameState.players.find(p => p.id === action.blockerId);
                 log(`🕵️ ${player.name} проверяет блок от ${blocker.name} на роль [${action.claimedRole}]`);
@@ -420,17 +394,14 @@ io.on('connection', (socket) => {
                     gameState.deck.sort(() => Math.random() - 0.5);
 
                     gameState.pendingAction = {
-                        type: 'loseCard',
-                        targetId: player.id,
+                        type: 'loseCard', targetId: player.id,
                         message: `Блок был честным! Выберите карту для сброса:`,
                         nextAction: { type: 'endTurn' }
                     };
                 } else {
                     log(`🚨 Ложный блок! У ${blocker.name} нет роли [${action.claimedRole}]. Действие выполняется!`);
-                    
                     gameState.pendingAction = {
-                        type: 'loseCard',
-                        targetId: blocker.id,
+                        type: 'loseCard', targetId: blocker.id,
                         message: `Вас поймали на лжи при блокировке! Сбросьте карту:`,
                         nextAction: { type: 'executeAfterChallengeBlockFailure', sourceId: action.originalSourceId, actionData: action.actionData }
                     };
@@ -443,28 +414,28 @@ io.on('connection', (socket) => {
             if (player.cards[data.cardIndex].isDead) return;
 
             player.cards[data.cardIndex].isDead = true;
-            log(`💀 ${player.name} теряет карту [${player.cards[data.cardIndex].role}]`);
+            
+            // Фикс режима сокрытия ролей
+            const lostRole = player.cards[data.cardIndex].role;
+            const displayRole = gameState.hideDiscards ? 'Скрыто 🤫' : lostRole;
+            log(`💀 ${player.name} теряет карту [${displayRole}]`);
+            
             checkPlayerDeath(player);
 
-            // Если после потери карты игра закончилась (кто-то победил), останавливаем цепочку действий
             if (!gameState.started) {
-                gameState.pendingAction = null;
-                sendState();
-                return;
+                gameState.pendingAction = null; sendState(); return;
             }
 
             const next = action.nextAction;
             if (next && next.type === 'endTurn') {
-                gameState.pendingAction = null;
-                nextTurn();
+                gameState.pendingAction = null; nextTurn();
             } else if (next && next.type === 'continueAfterChallengeSuccess') {
                 goToBlockOrExecute(next.sourceId, next.actionData);
             } else if (next && next.type === 'executeAfterChallengeBlockFailure') {
                 const srcPlayer = gameState.players.find(p => p.id === next.sourceId);
                 executeAction(srcPlayer, next.actionData);
             } else {
-                gameState.pendingAction = null;
-                nextTurn();
+                gameState.pendingAction = null; nextTurn();
             }
             sendState();
         }
@@ -472,7 +443,6 @@ io.on('connection', (socket) => {
         else if (action.type === 'exchange' && socket.id === action.targetId && data.type === 'exchange') {
             const selected = data.selectedIndices;
             if (!Array.isArray(selected) || selected.length !== action.requiredToKeep) return;
-
             const keptRoles = selected.map(i => action.options[i]);
             const discardedRoles = action.options.filter((_, i) => !selected.includes(i));
 
@@ -480,14 +450,10 @@ io.on('connection', (socket) => {
             gameState.deck.sort(() => Math.random() - 0.5);
 
             let keptIdx = 0;
-            player.cards.forEach(c => {
-                if (!c.isDead) c.role = keptRoles[keptIdx++];
-            });
+            player.cards.forEach(c => { if (!c.isDead) c.role = keptRoles[keptIdx++]; });
 
             log(`🔄 ${player.name} завершил обмен карт`);
-            gameState.pendingAction = null;
-            nextTurn();
-            sendState();
+            gameState.pendingAction = null; nextTurn(); sendState();
         }
     });
 
@@ -495,7 +461,7 @@ io.on('connection', (socket) => {
         const pIdx = gameState.players.findIndex(p => p.id === socket.id);
         if (pIdx !== -1) {
             const player = gameState.players[pIdx];
-            log(`🚪 ${player.name} вышел из игры`);
+            log(`🚪 ${player.name} потерял соединение`);
             
             if (gameState.started) {
                 player.isDead = true;
@@ -503,15 +469,15 @@ io.on('connection', (socket) => {
                 player.cards.forEach(c => c.isDead = true);
                 checkPlayerDeath(player);
                 
-                // Если после лива игра всё ещё идёт, а завис ход ливнувшего, двигаем дальше
-                if (gameState.started && (gameState.players[gameState.currentTurnIdx].id === socket.id || gameState.pendingAction)) {
+                // Фикс зависания, если ливнул во время своего экшена
+                if (gameState.started && (gameState.players[gameState.currentTurnIdx].id === socket.id || 
+                   (gameState.pendingAction && gameState.pendingAction.targetId === socket.id))) {
                     gameState.pendingAction = null;
                     nextTurn();
                 }
             } else {
                 gameState.players.splice(pIdx, 1);
             }
-            
             io.emit('lobbyUpdate', gameState.players.filter(p => !p.disconnected));
             sendState();
         }
@@ -519,6 +485,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-http.listen(PORT, () => {
-    console.log(`Сервер запущен на порту: ${PORT}`);
-});
+http.listen(PORT, () => { console.log(`Сервер запущен на порту: ${PORT}`); });
